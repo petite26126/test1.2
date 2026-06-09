@@ -1,8 +1,10 @@
 import discord
-from discord.ext import commands
+from discord.ext 
+import commands
 import wavelink
 import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
+from spotipy.oauth2 
+import SpotifyClientCredentials
 import os
 
 TOKEN = os.getenv("TOKEN")

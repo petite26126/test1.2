@@ -1,44 +1,43 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 import yt_dlp
 import os
 
 TOKEN = os.getenv("TOKEN")
 
-intents = discord.Intents.all()
+intents = discord.Intents.default()
+intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# EVENTOS
+# SYNC DOS SLASH COMMANDS
 # =========================
 @bot.event
 async def on_ready():
+    await bot.tree.sync()
     print(f"Bot online: {bot.user}")
 
-@bot.event
-async def on_member_join(member):
-    if member.guild.system_channel:
-        await member.guild.system_channel.send(f"Bem-vindo {member.mention}!")
-
 # =========================
-# COMANDOS
+# SLASH COMMANDS
 # =========================
-@bot.command()
-async def ping(ctx):
-    await ctx.send("Pong!")
+@bot.tree.command(name="ping", description="Ver latência do bot")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("Pong!")
 
 # =========================
 # MÚSICA
 # =========================
 ytdl = yt_dlp.YoutubeDL({'format': 'bestaudio'})
 
-@bot.command()
-async def play(ctx, *, query):
-    if not ctx.author.voice:
-        return await ctx.send("Entre em um canal de voz!")
+@bot.tree.command(name="play", description="Tocar música")
+async def play(interaction: discord.Interaction, query: str):
+    if not interaction.user.voice:
+        return await interaction.response.send_message("Entre em um canal de voz!")
 
-    channel = ctx.author.voice.channel
-    voice = ctx.voice_client
+    channel = interaction.user.voice.channel
+    voice = interaction.guild.voice_client
 
     if not voice:
         voice = await channel.connect()
@@ -50,11 +49,12 @@ async def play(ctx, *, query):
     source = await discord.FFmpegOpusAudio.from_probe(url)
     voice.play(source)
 
-    await ctx.send(f"Tocando: {title}")
+    await interaction.response.send_message(f"Tocando: {title}")
 
-@bot.command()
-async def stop(ctx):
-    if ctx.voice_client:
-        await ctx.voice_client.disconnect()
+@bot.tree.command(name="stop", description="Parar música")
+async def stop(interaction: discord.Interaction):
+    if interaction.guild.voice_client:
+        await interaction.guild.voice_client.disconnect()
+        await interaction.response.send_message("Parado!")
 
 bot.run(TOKEN)

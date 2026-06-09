@@ -1,227 +1,185 @@
 import discord
 from discord.ext import commands
-from discord import app_commands
-import yt_dlp
-import asyncio
+import wavelink
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
 import os
-import random
-from collections import deque
 
 TOKEN = os.getenv("TOKEN")
 
+sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+    client_id=os.getenv("SPOTIFY_CLIENT_ID"),
+    client_secret=os.getenv("SPOTIFY_CLIENT_SECRET")
+))
+
 intents = discord.Intents.default()
-intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# YTDL CONFIG (robusto)
-# =========================
-YTDL_OPTS = {
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "default_search": "ytsearch",
-    "source_address": "0.0.0.0"
-}
-ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
-
-FFMPEG_OPTS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn"
-}
-
-# =========================
-# ESTADO POR SERVIDOR
-# =========================
-class Estado:
-    def __init__(self):
-        self.fila = deque()
-        self.atual = None
-        self.loop = "off"     # off | track | queue
-        self.volume = 1.0
-        self.autoplay = False
-
-estados = {}
-
-def get_estado(guild):
-    if guild.id not in estados:
-        estados[guild.id] = Estado()
-    return estados[guild.id]
-
-# =========================
-# BUSCA ASSÍNCRONA
-# =========================
-async def buscar(query):
-    loop = asyncio.get_event_loop()
-    data = await loop.run_in_executor(
-        None, lambda: ytdl.extract_info(query, download=False)
-    )
-    if "entries" in data:
-        data = data["entries"][0]
-    return {
-        "url": data["url"],
-        "titulo": data.get("title", "Sem título"),
-        "web": data.get("webpage_url")
-    }
-
-# =========================
-# PLAYER
-# =========================
-async def tocar_proxima(guild):
-    estado = get_estado(guild)
-    voice = guild.voice_client
-
-    if not voice:
-        return
-
-    # loop track
-    if estado.loop == "track" and estado.atual:
-        estado.fila.appendleft(estado.atual)
-
-    # se acabou a fila
-    if not estado.fila:
-        estado.atual = None
-        return
-
-    track = estado.fila.popleft()
-    estado.atual = track
-
-    src = await discord.FFmpegOpusAudio.from_probe(
-        track["url"], **FFMPEG_OPTS
-    )
-    src = discord.PCMVolumeTransformer(src, volume=estado.volume)
-
-    def _after(e):
-        asyncio.run_coroutine_threadsafe(tocar_proxima(guild), bot.loop)
-
-    voice.play(src, after=_after)
-
-# =========================
-# READY
+# LAVALINK
 # =========================
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
     print(f"🔥 Online: {bot.user}")
+
+    node = wavelink.Node(
+        uri=os.getenv("LAVALINK_URL"),
+        password=os.getenv("LAVALINK_PASSWORD")
+    )
+
+    await wavelink.Pool.connect(client=bot, nodes=[node])
+    await bot.tree.sync()
+
+# =========================
+# UTIL
+# =========================
+def is_spotify(url):
+    return "spotify.com" in url
+
+def spotify_to_queries(url):
+    queries = []
+
+    if "track" in url:
+        t = sp.track(url)
+        queries.append(f"{t['name']} {t['artists'][0]['name']}")
+
+    elif "playlist" in url:
+        data = sp.playlist_items(url)
+        for item in data['items']:
+            track = item['track']
+            if track:
+                queries.append(f"{track['name']} {track['artists'][0]['name']}")
+
+    elif "album" in url:
+        data = sp.album_tracks(url)
+        for t in data['items']:
+            queries.append(f"{t['name']} {t['artists'][0]['name']}")
+
+    return queries
+
+async def get_player(interaction):
+    if not interaction.user.voice:
+        return None, "❌ Entra num canal de voz"
+
+    canal = interaction.user.voice.channel
+
+    if not interaction.guild.voice_client:
+        player = await canal.connect(cls=wavelink.Player)
+    else:
+        player = interaction.guild.voice_client
+
+    return player, None
+
+# =========================
+# PLAYER EVENTS
+# =========================
+@bot.listen("on_wavelink_track_end")
+async def on_track_end(payload):
+    player = payload.player
+
+    if player.queue.is_empty:
+        return
+
+    next_track = await player.queue.get_wait()
+    await player.play(next_track)
 
 # =========================
 # /TOCAR
 # =========================
-@bot.tree.command(name="tocar", description="Tocar música (nome ou link)")
+@bot.tree.command(name="tocar", description="Tocar música ou Spotify")
 async def tocar(interaction: discord.Interaction, pesquisa: str):
+
     await interaction.response.defer()
 
-    if not interaction.user.voice:
-        return await interaction.followup.send("❌ Entra num canal de voz.")
+    player, erro = await get_player(interaction)
+    if erro:
+        return await interaction.followup.send(erro)
 
-    canal = interaction.user.voice.channel
-    voice = interaction.guild.voice_client
+    queries = []
 
-    if not voice:
-        voice = await canal.connect()
+    try:
+        if is_spotify(pesquisa):
+            queries = spotify_to_queries(pesquisa)
+        else:
+            queries = [pesquisa]
+    except:
+        return await interaction.followup.send("❌ Erro no Spotify")
 
-    track = await buscar(pesquisa)
-    estado = get_estado(interaction.guild)
-    estado.fila.append(track)
+    adicionadas = 0
 
-    if not voice.is_playing():
-        await tocar_proxima(interaction.guild)
+    for q in queries:
+        tracks = await wavelink.Playable.search(q)
+        if tracks:
+            await player.queue.put_wait(tracks[0])
+            adicionadas += 1
 
-    await interaction.followup.send(f"🎵 Adicionado: {track['titulo']}")
+    if not player.playing:
+        track = await player.queue.get_wait()
+        await player.play(track)
 
-# =========================
-# CONTROLES
-# =========================
-@bot.tree.command(name="pausar", description="Pausar")
-async def pausar(interaction: discord.Interaction):
-    v = interaction.guild.voice_client
-    if v and v.is_playing():
-        v.pause()
-        await interaction.response.send_message("⏸️ Pausado")
-
-@bot.tree.command(name="retomar", description="Retomar")
-async def retomar(interaction: discord.Interaction):
-    v = interaction.guild.voice_client
-    if v and v.is_paused():
-        v.resume()
-        await interaction.response.send_message("▶️ Retomado")
-
-@bot.tree.command(name="pular", description="Pular")
-async def pular(interaction: discord.Interaction):
-    v = interaction.guild.voice_client
-    if v:
-        v.stop()
-        await interaction.response.send_message("⏭️ Pulado")
-
-@bot.tree.command(name="parar", description="Parar e sair")
-async def parar(interaction: discord.Interaction):
-    v = interaction.guild.voice_client
-    if v:
-        estados.pop(interaction.guild.id, None)
-        await v.disconnect()
-        await interaction.response.send_message("🛑 Parado")
+    await interaction.followup.send(f"🎵 {adicionadas} música(s) na fila")
 
 # =========================
-# FILA
+# /FILA
 # =========================
 @bot.tree.command(name="fila", description="Ver fila")
 async def fila(interaction: discord.Interaction):
-    estado = get_estado(interaction.guild)
+    player = interaction.guild.voice_client
 
-    if not estado.fila:
+    if not player or player.queue.is_empty:
         return await interaction.response.send_message("📭 Fila vazia")
 
-    msg = "\n".join(
-        [f"{i+1}. {t['titulo']}" for i, t in enumerate(list(estado.fila)[:10])]
+    lista = "\n".join(
+        [f"{i+1}. {t.title}" for i, t in enumerate(player.queue)]
     )
-    await interaction.response.send_message(f"📃 Fila:\n{msg}")
 
-@bot.tree.command(name="remover", description="Remover da fila")
-async def remover(interaction: discord.Interaction, posicao: int):
-    estado = get_estado(interaction.guild)
-
-    if posicao <= 0 or posicao > len(estado.fila):
-        return await interaction.response.send_message("❌ Posição inválida")
-
-    track = list(estado.fila)[posicao-1]
-    estado.fila.remove(track)
-    await interaction.response.send_message(f"🗑️ Removido: {track['titulo']}")
-
-@bot.tree.command(name="embaralhar", description="Misturar fila")
-async def embaralhar(interaction: discord.Interaction):
-    estado = get_estado(interaction.guild)
-    temp = list(estado.fila)
-    random.shuffle(temp)
-    estado.fila = deque(temp)
-    await interaction.response.send_message("🔀 Embaralhado")
+    await interaction.response.send_message(f"📜 Fila:\n{lista[:1900]}")
 
 # =========================
-# LOOP / VOLUME / NOW
+# /SKIP
 # =========================
-@bot.tree.command(name="loop", description="Loop (off, track, queue)")
-async def loop_cmd(interaction: discord.Interaction, modo: str):
-    estado = get_estado(interaction.guild)
-    estado.loop = modo
-    await interaction.response.send_message(f"🔁 Loop: {modo}")
+@bot.tree.command(name="skip", description="Pular música")
+async def skip(interaction: discord.Interaction):
+    player = interaction.guild.voice_client
 
-@bot.tree.command(name="volume", description="Volume 0-100")
-async def volume(interaction: discord.Interaction, valor: int):
-    estado = get_estado(interaction.guild)
-    estado.volume = max(0, min(valor, 100)) / 100
+    if not player:
+        return await interaction.response.send_message("❌ Nada tocando")
 
-    v = interaction.guild.voice_client
-    if v and v.source:
-        v.source.volume = estado.volume
-
-    await interaction.response.send_message(f"🔊 {valor}%")
-
-@bot.tree.command(name="agora", description="Música atual")
-async def agora(interaction: discord.Interaction):
-    estado = get_estado(interaction.guild)
-    if estado.atual:
-        await interaction.response.send_message(f"🎶 {estado.atual['titulo']}")
-    else:
-        await interaction.response.send_message("Nada tocando")
+    await player.stop()
+    await interaction.response.send_message("⏭ Pulado")
 
 # =========================
+# /PAUSAR
+# =========================
+@bot.tree.command(name="pausar", description="Pausar")
+async def pausar(interaction: discord.Interaction):
+    player = interaction.guild.voice_client
+
+    if player:
+        await player.pause()
+        await interaction.response.send_message("⏸ Pausado")
+
+# =========================
+# /RESUMIR
+# =========================
+@bot.tree.command(name="resumir", description="Continuar")
+async def resumir(interaction: discord.Interaction):
+    player = interaction.guild.voice_client
+
+    if player:
+        await player.resume()
+        await interaction.response.send_message("▶️ Continuando")
+
+# =========================
+# /PARAR
+# =========================
+@bot.tree.command(name="parar", description="Parar tudo")
+async def parar(interaction: discord.Interaction):
+    player = interaction.guild.voice_client
+
+    if player:
+        await player.disconnect()
+
+    await interaction.response.send_message("🛑 Parado")
+
 bot.run(TOKEN)
